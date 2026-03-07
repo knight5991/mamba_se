@@ -347,9 +347,5 @@ class MambaSEUNet(nn.Module):
         denoised_com_2ch = self.output_complex_conv(denoised_com_2ch)
         denoised_com = rearrange(denoised_com_2ch, 'b c t f -> b f t c')
 
-        denoised_real = denoised_com[..., 0]
-        denoised_imag = denoised_com[..., 1]
-        denoised_mag = torch.sqrt(denoised_real ** 2 + denoised_imag ** 2 + 1e-9)
-        denoised_pha = torch.atan2(denoised_imag, denoised_real)
-
+        # Keep magnitude/phase decoding path unchanged for training stability.
         return denoised_mag, denoised_pha, denoised_com

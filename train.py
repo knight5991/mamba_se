@@ -244,8 +244,10 @@ def train(rank, args, cfg):
             # Anti-wrapping Phase Loss
             loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g, cfg)
             loss_pha = loss_ip + loss_gd + loss_iaf
-            # L2 Complex Loss
-            loss_com = F.mse_loss(clean_com, com_g) * 2
+            # L2 Complex Loss (real + imag channels)
+            loss_com_real = F.mse_loss(clean_com[..., 0], com_g[..., 0])
+            loss_com_imag = F.mse_loss(clean_com[..., 1], com_g[..., 1])
+            loss_com = (loss_com_real + loss_com_imag) * 2
             # Time Loss
             loss_time = F.l1_loss(clean_audio, audio_g)
             # Metric Loss
@@ -416,7 +418,7 @@ def train(rank, args, cfg):
                             val_mag_err_tot += F.mse_loss(clean_mag, mag_g).item()
                             val_ip_err, val_gd_err, val_iaf_err = phase_losses(clean_pha, pha_g, cfg)
                             val_pha_err_tot += (val_ip_err + val_gd_err + val_iaf_err).item()
-                            val_com_err_tot += F.mse_loss(clean_com, com_g).item()
+                            val_com_err_tot += (F.mse_loss(clean_com[..., 0], com_g[..., 0]) + F.mse_loss(clean_com[..., 1], com_g[..., 1])).item()
 
                         val_mag_err = val_mag_err_tot / (j+1)
                         val_pha_err = val_pha_err_tot / (j+1)

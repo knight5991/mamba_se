@@ -8,6 +8,20 @@ from einops import rearrange
 from .mamba_block import TFMambaBlock
 from .codec_module import DenseEncoder, MagDecoder, PhaseDecoder
 
+
+class ComplexConv2d(nn.Module):
+    """Complex 2D convolution implemented with paired real convolutions."""
+    def __init__(self, in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=True):
+        super().__init__()
+        self.conv_re = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+        self.conv_im = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+
+    def forward(self, x):
+        real, imag = torch.chunk(x, 2, dim=1)
+        out_real = self.conv_re(real) - self.conv_im(imag)
+        out_imag = self.conv_re(imag) + self.conv_im(real)
+        return torch.cat((out_real, out_imag), dim=1)
+
 #####################################
 class DWConv2d_BN(nn.Module):
 
@@ -160,6 +174,9 @@ class MambaSEUNet(nn.Module):
         self.dim = [cfg['model_cfg']['hid_feature'], cfg['model_cfg']['hid_feature'] * 2, cfg['model_cfg']['hid_feature'] * 3]
         dim = self.dim
 
+        # Entry complex projection (real+imag channels)
+        self.input_complex_conv = ComplexConv2d(in_channels=1, out_channels=1, kernel_size=1, stride=1, padding=0, bias=False)
+
         # Initialize dense encoder
         self.dense_encoder = DenseEncoder(cfg)
 
@@ -226,6 +243,9 @@ class MambaSEUNet(nn.Module):
         self.mask_decoder = MagDecoder(cfg)
         self.phase_decoder = PhaseDecoder(cfg)
 
+        # Exit complex projection (predict real+imag channels)
+        self.output_complex_conv = ComplexConv2d(in_channels=1, out_channels=1, kernel_size=1, stride=1, padding=0, bias=False)
+
     def forward(self, noisy_mag, noisy_pha):
         """
         Forward pass for the SEMamba model.
@@ -243,8 +263,9 @@ class MambaSEUNet(nn.Module):
         noisy_mag = rearrange(noisy_mag, 'b f t -> b t f').unsqueeze(1)  # [B, 1, T, F]
         noisy_pha = rearrange(noisy_pha, 'b f t -> b t f').unsqueeze(1)  # [B, 1, T, F]
 
-        # Concatenate magnitude and phase inputs
+        # Concatenate magnitude and phase inputs and apply complex projection
         x = torch.cat((noisy_mag, noisy_pha), dim=1)  # [B, 2, T, F]
+        x = self.input_complex_conv(x)
 
         # Encode input
         x1 = self.dense_encoder(x)
@@ -321,4 +342,10 @@ class MambaSEUNet(nn.Module):
             dim=-1
         )
 
+        # Final complex output layer predicts refined real/imag channels
+        denoised_com_2ch = rearrange(denoised_com, 'b f t c -> b c t f')
+        denoised_com_2ch = self.output_complex_conv(denoised_com_2ch)
+        denoised_com = rearrange(denoised_com_2ch, 'b c t f -> b f t c')
+
+        # Keep magnitude/phase decoding path unchanged for training stability.
         return denoised_mag, denoised_pha, denoised_com

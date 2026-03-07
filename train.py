@@ -7,6 +7,8 @@ import os
 import time
 import argparse
 import json
+import random
+import numpy as np
 import yaml
 import torch
 import torch.optim as optim
@@ -27,7 +29,22 @@ from utils.util import (
     print_gpu_info, log_model_info, initialize_process_group,
 )
 
-torch.backends.cudnn.benchmark = True
+
+def set_random_seed(seed):
+    """Set random seed for full training reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id):
+    """Ensure dataloader workers use deterministic RNG states."""
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 def setup_optimizers(models, cfg):
     """Set up optimizers for the models."""
@@ -98,16 +115,17 @@ def create_dataset(cfg, train=True, split=True, device='cuda:0'):
         pcs=pcs
     )
 
-def create_dataloader(dataset, cfg, train=True):
+def create_dataloader(dataset, cfg, train=True, seed=0, rank=0):
     """Create dataloader based on dataset and configuration."""
+    sampler = None
     if cfg['env_setting']['num_gpus'] > 1:
-        sampler = DistributedSampler(dataset)
-        sampler.set_epoch(cfg['training_cfg']['training_epochs'])
+        sampler = DistributedSampler(dataset, shuffle=train, seed=seed)
         batch_size = (cfg['training_cfg']['batch_size'] // cfg['env_setting']['num_gpus']) if train else 1
     else:
-        sampler = None
         batch_size = cfg['training_cfg']['batch_size'] if train else 1
     num_workers = cfg['env_setting']['num_workers']
+    dataloader_generator = torch.Generator()
+    dataloader_generator.manual_seed(seed + rank)
 
     return DataLoader(
         dataset,
@@ -116,12 +134,18 @@ def create_dataloader(dataset, cfg, train=True):
         sampler=sampler,
         batch_size=batch_size,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=dataloader_generator
     )
 
 
 def train(rank, args, cfg):
     num_gpus = cfg['env_setting']['num_gpus']
+    seed = cfg['env_setting']['seed']
+    process_seed = seed + rank
+    set_random_seed(process_seed)
+
     n_fft, hop_size, win_size = cfg['stft_cfg']['n_fft'], cfg['stft_cfg']['hop_size'], cfg['stft_cfg']['win_size']
     compress_factor = cfg['model_cfg']['compress_factor']
     batch_size = cfg['training_cfg']['batch_size'] // cfg['env_setting']['num_gpus']
@@ -154,12 +178,12 @@ def train(rank, args, cfg):
 
     # Create trainset and train_loader
     trainset = create_dataset(cfg, train=True, split=True, device=device)
-    train_loader = create_dataloader(trainset, cfg, train=True)
+    train_loader = create_dataloader(trainset, cfg, train=True, seed=seed, rank=rank)
 
     # Create validset and validation_loader if rank is 0
     if rank == 0:
         validset = create_val_dataset(cfg, train=False, split=False, device=device)
-        validation_loader = create_dataloader(validset, cfg, train=False)
+        validation_loader = create_dataloader(validset, cfg, train=False, seed=seed, rank=rank)
         sw = SummaryWriter(os.path.join(args.exp_path, 'logs'))
 
     generator.train()
@@ -167,6 +191,9 @@ def train(rank, args, cfg):
 
     best_pesq, best_pesq_step = 0.0, 0
     for epoch in range(max(0, last_epoch), cfg['training_cfg']['training_epochs']):
+        if isinstance(train_loader.sampler, DistributedSampler):
+            train_loader.sampler.set_epoch(epoch)
+
         if rank == 0:
             start = time.time()
             print("Epoch: {}".format(epoch+1))
@@ -217,8 +244,10 @@ def train(rank, args, cfg):
             # Anti-wrapping Phase Loss
             loss_ip, loss_gd, loss_iaf = phase_losses(clean_pha, pha_g, cfg)
             loss_pha = loss_ip + loss_gd + loss_iaf
-            # L2 Complex Loss
-            loss_com = F.mse_loss(clean_com, com_g) * 2
+            # L2 Complex Loss (real + imag channels)
+            loss_com_real = F.mse_loss(clean_com[..., 0], com_g[..., 0])
+            loss_com_imag = F.mse_loss(clean_com[..., 1], com_g[..., 1])
+            loss_com = (loss_com_real + loss_com_imag) * 2
             # Time Loss
             loss_time = F.l1_loss(clean_audio, audio_g)
             # Metric Loss
@@ -389,7 +418,7 @@ def train(rank, args, cfg):
                             val_mag_err_tot += F.mse_loss(clean_mag, mag_g).item()
                             val_ip_err, val_gd_err, val_iaf_err = phase_losses(clean_pha, pha_g, cfg)
                             val_pha_err_tot += (val_ip_err + val_gd_err + val_iaf_err).item()
-                            val_com_err_tot += F.mse_loss(clean_com, com_g).item()
+                            val_com_err_tot += (F.mse_loss(clean_com[..., 0], com_g[..., 0]) + F.mse_loss(clean_com[..., 1], com_g[..., 1])).item()
 
                         val_mag_err = val_mag_err_tot / (j+1)
                         val_pha_err = val_pha_err_tot / (j+1)
@@ -427,6 +456,11 @@ def main():
 
     cfg = load_config(args.config)
     seed = cfg['env_setting']['seed']
+
+    set_random_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
     num_gpus = cfg['env_setting']['num_gpus']
     available_gpus = torch.cuda.device_count()
 
